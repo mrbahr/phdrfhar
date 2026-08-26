@@ -1,5 +1,7 @@
 import os
 import re
+import sys
+import random
 import subprocess
 import requests
 import csv
@@ -13,10 +15,12 @@ HEADERS = {
 }
 
 MAX_ITEMS = 10000
-DETAIL_DELAY_SEC = 1.0
+MIN_DELAY_SEC = 1.5
+MAX_DELAY_SEC = 3.0
 CSV_FILE = "phdrfhar.csv"
 PROGRESS_FILE = "progress_ids.txt"
-CHECKPOINT_EVERY = 500
+CHECKPOINT_EVERY = 1000
+WORKFLOW_FILE = "daily_upnew.yml"
 
 
 def strip_html(text):
@@ -96,7 +100,7 @@ def build_row(p):
     requires_fridge = "ثلاج" in special_label_ar
 
     details = get_product_full_details(slug) if slug else {}
-    time.sleep(DETAIL_DELAY_SEC)
+    time.sleep(random.uniform(MIN_DELAY_SEC, MAX_DELAY_SEC))
 
     return [
         name_ar, name_en, price,
@@ -130,6 +134,7 @@ def git_checkpoint(item_count):
             capture_output=True, text=True
         )
         if commit.returncode == 0:
+            push = subprocess.run(["git", "pull", "--rebase"], capture_output=True, text=True)
             push = subprocess.run(["git", "push"], capture_output=True, text=True)
             if push.returncode == 0:
                 print(f"[Checkpoint] Committed and pushed at {item_count} items.")
@@ -139,6 +144,33 @@ def git_checkpoint(item_count):
             print(f"[Checkpoint] Nothing new to commit ({commit.stdout.strip()} {commit.stderr.strip()})")
     except Exception as e:
         print(f"[Checkpoint] Git error: {e}")
+
+
+def trigger_next_run():
+    token = os.environ.get("GH_DISPATCH_TOKEN")
+    repo = os.environ.get("GITHUB_REPOSITORY")
+    ref = os.environ.get("GITHUB_REF_NAME", "main")
+
+    if not token or not repo:
+        print("[Handoff] Missing GH_DISPATCH_TOKEN or GITHUB_REPOSITORY, cannot trigger next run.")
+        return False
+
+    url = f"https://api.github.com/repos/{repo}/actions/workflows/{WORKFLOW_FILE}/dispatches"
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github+json",
+    }
+    try:
+        res = requests.post(url, headers=headers, json={"ref": ref}, timeout=15)
+        if res.status_code in (204, 201):
+            print("[Handoff] Successfully triggered a new workflow run to continue.")
+            return True
+        else:
+            print(f"[Handoff] Failed to trigger next run: {res.status_code} {res.text}")
+            return False
+    except Exception as e:
+        print(f"[Handoff] Error triggering next run: {e}")
+        return False
 
 
 def run_scraper():
@@ -153,6 +185,7 @@ def run_scraper():
         print(f"Starting fresh scrape (max {MAX_ITEMS} items). Output file: {CSV_FILE}")
 
     total_items = len(seen_ids)
+    batch_start_count = total_items
 
     csv_file = open(CSV_FILE, mode=file_mode, newline="", encoding="utf-8-sig")
     progress_file = open(PROGRESS_FILE, mode="a")
@@ -172,6 +205,7 @@ def run_scraper():
     consecutive_duplicate_pages = 0
     MAX_CONSECUTIVE_DUPLICATE_PAGES = 3
     MAX_PAGES_SAFETY = 3000
+    catalog_finished = False
 
     while total_items < MAX_ITEMS and page_num <= MAX_PAGES_SAFETY:
         params = {"enable_search_side_filters": "1", "page": page_num}
@@ -180,7 +214,7 @@ def run_scraper():
             print(f"Page {page_num} -> HTTP status: {response.status_code}")
 
             if response.status_code != 200:
-                print("Non-200 status, stopping.")
+                print("Non-200 status, stopping this run.")
                 break
 
             data = response.json()
@@ -188,7 +222,8 @@ def run_scraper():
             print(f"Page {page_num} -> products returned: {len(products)}")
 
             if not products:
-                print("No products on this page, stopping.")
+                print("No products on this page. Catalog finished.")
+                catalog_finished = True
                 break
 
             new_products = [p for p in products if p.get("id") not in seen_ids]
@@ -198,7 +233,8 @@ def run_scraper():
                 print(f"All products on this page already seen "
                       f"({consecutive_duplicate_pages}/{MAX_CONSECUTIVE_DUPLICATE_PAGES} consecutive duplicate pages).")
                 if consecutive_duplicate_pages >= MAX_CONSECUTIVE_DUPLICATE_PAGES:
-                    print("Confirmed end of catalog. Stopping.")
+                    print("Confirmed end of catalog. Catalog finished.")
+                    catalog_finished = True
                     break
                 page_num += 1
                 continue
@@ -221,10 +257,16 @@ def run_scraper():
                     elapsed = time.time() - start_time
                     print(f"[{total_items}/{MAX_ITEMS}] {row[1]} (elapsed: {elapsed:.1f}s)")
 
-                    if total_items % CHECKPOINT_EVERY == 0:
+                    if total_items - batch_start_count >= CHECKPOINT_EVERY:
                         csv_file.flush()
                         progress_file.flush()
+                        csv_file.close()
+                        progress_file.close()
                         git_checkpoint(total_items)
+                        triggered = trigger_next_run()
+                        print(f"\nBatch of {CHECKPOINT_EVERY} done. Total so far: {total_items}. "
+                              f"Handoff triggered: {triggered}. Ending this run.")
+                        sys.exit(0)
 
                 except Exception:
                     print(f"[Row error] id={p.get('id')} name={p.get('name_en')}")
@@ -244,7 +286,11 @@ def run_scraper():
     git_checkpoint(total_items)
 
     total_time = time.time() - start_time
-    print(f"\nDone. Total items in file: {total_items}. This run took {total_time:.1f} seconds.")
+    if catalog_finished or total_items >= MAX_ITEMS:
+        print(f"\nAll done. Full catalog scraped. Total items: {total_items}. This run took {total_time:.1f} seconds.")
+    else:
+        print(f"\nRun ended (page safety limit or error). Total items so far: {total_items}. "
+              f"This run took {total_time:.1f} seconds.")
 
 
 if __name__ == "__main__":
