@@ -120,6 +120,7 @@ def run_scraper():
         page_num = 1
         total_items = 0
         start_time = time.time()
+        previous_ids = None
 
         while total_items < MAX_ITEMS:
             params = {"enable_search_side_filters": "1", "page": page_num}
@@ -138,6 +139,12 @@ def run_scraper():
                 if not products:
                     print("No products on this page, stopping.")
                     break
+
+                current_ids = tuple(p.get("id") for p in products)
+                if current_ids == previous_ids:
+                    print("Same products as previous page detected. Reached end of catalog. Stopping.")
+                    break
+                previous_ids = current_ids
 
                 for p in products:
                     if total_items >= MAX_ITEMS:
