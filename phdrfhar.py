@@ -203,9 +203,10 @@ def run_scraper():
     page_num = 1
     start_time = time.time()
     consecutive_duplicate_pages = 0
-    MAX_CONSECUTIVE_DUPLICATE_PAGES = 3
+    MAX_CONSECUTIVE_DUPLICATE_PAGES = 5
     MAX_PAGES_SAFETY = 3000
     catalog_finished = False
+    known_total = None
 
     while total_items < MAX_ITEMS and page_num <= MAX_PAGES_SAFETY:
         params = {"enable_search_side_filters": "1", "page": page_num}
@@ -218,7 +219,14 @@ def run_scraper():
                 break
 
             data = response.json()
-            products = data.get("data", {}).get("products", [])
+            inner = data.get("data", {})
+            products = inner.get("products", [])
+
+            if known_total is None:
+                known_total = inner.get("total")
+                if known_total:
+                    print(f"Catalog total reported by API: {known_total} products.")
+
             print(f"Page {page_num} -> products returned: {len(products)}")
 
             if not products:
@@ -274,6 +282,11 @@ def run_scraper():
                     continue
 
             page_num += 1
+
+            if known_total is not None and total_items >= known_total:
+                print(f"Reached API-reported total of {known_total} items. Catalog finished.")
+                catalog_finished = True
+                break
 
         except requests.exceptions.RequestException as e:
             print(f"[Connection issue] {e} - retrying in 5s")
