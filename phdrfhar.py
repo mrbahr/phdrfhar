@@ -1,4 +1,6 @@
+import os
 import re
+import subprocess
 import requests
 import csv
 import time
@@ -11,7 +13,10 @@ HEADERS = {
 }
 
 MAX_ITEMS = 10000
-DETAIL_DELAY_SEC = 2.0
+DETAIL_DELAY_SEC = 1.0
+CSV_FILE = "phdrfhar.csv"
+PROGRESS_FILE = "progress_ids.txt"
+CHECKPOINT_EVERY = 500
 
 
 def strip_html(text):
@@ -103,74 +108,143 @@ def build_row(p):
     ]
 
 
-def run_scraper():
-    filename = "phdrfhar.csv"
-    print(f"Starting scrape (max {MAX_ITEMS} items). Output file: {filename}")
+def load_progress():
+    seen_ids = set()
+    if os.path.exists(PROGRESS_FILE):
+        with open(PROGRESS_FILE, "r") as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    try:
+                        seen_ids.add(int(line))
+                    except ValueError:
+                        continue
+    return seen_ids
 
-    with open(filename, mode="w", newline="", encoding="utf-8-sig") as file:
-        writer = csv.writer(file)
+
+def git_checkpoint(item_count):
+    try:
+        subprocess.run(["git", "add", CSV_FILE, PROGRESS_FILE], check=True)
+        commit = subprocess.run(
+            ["git", "commit", "-m", f"Checkpoint: {item_count} items scraped"],
+            capture_output=True, text=True
+        )
+        if commit.returncode == 0:
+            push = subprocess.run(["git", "push"], capture_output=True, text=True)
+            if push.returncode == 0:
+                print(f"[Checkpoint] Committed and pushed at {item_count} items.")
+            else:
+                print(f"[Checkpoint] Push failed: {push.stderr.strip()}")
+        else:
+            print(f"[Checkpoint] Nothing new to commit ({commit.stdout.strip()} {commit.stderr.strip()})")
+    except Exception as e:
+        print(f"[Checkpoint] Git error: {e}")
+
+
+def run_scraper():
+    seen_ids = load_progress()
+    resuming = len(seen_ids) > 0
+    write_header = not (resuming and os.path.exists(CSV_FILE))
+    file_mode = "a" if resuming and os.path.exists(CSV_FILE) else "w"
+
+    if resuming:
+        print(f"Resuming previous run. {len(seen_ids)} items already scraped.")
+    else:
+        print(f"Starting fresh scrape (max {MAX_ITEMS} items). Output file: {CSV_FILE}")
+
+    total_items = len(seen_ids)
+
+    csv_file = open(CSV_FILE, mode=file_mode, newline="", encoding="utf-8-sig")
+    progress_file = open(PROGRESS_FILE, mode="a")
+    writer = csv.writer(csv_file)
+
+    if write_header:
         writer.writerow([
             "Name_AR", "Name_EN", "Price",
             "Brand_AR", "Category_AR", "Sub_Category_AR",
             "Active_Ingredient", "Requires_Fridge",
             "Indications", "Dosage"
         ])
-        file.flush()
+        csv_file.flush()
 
-        page_num = 1
-        total_items = 0
-        start_time = time.time()
-        previous_ids = None
+    page_num = 1
+    start_time = time.time()
+    consecutive_duplicate_pages = 0
+    MAX_CONSECUTIVE_DUPLICATE_PAGES = 3
+    MAX_PAGES_SAFETY = 3000
 
-        while total_items < MAX_ITEMS:
-            params = {"enable_search_side_filters": "1", "page": page_num}
-            try:
-                response = requests.get(BASE_API_URL, headers=HEADERS, params=params, timeout=25)
-                print(f"Page {page_num} -> HTTP status: {response.status_code}")
+    while total_items < MAX_ITEMS and page_num <= MAX_PAGES_SAFETY:
+        params = {"enable_search_side_filters": "1", "page": page_num}
+        try:
+            response = requests.get(BASE_API_URL, headers=HEADERS, params=params, timeout=25)
+            print(f"Page {page_num} -> HTTP status: {response.status_code}")
 
-                if response.status_code != 200:
-                    print("Non-200 status, stopping.")
+            if response.status_code != 200:
+                print("Non-200 status, stopping.")
+                break
+
+            data = response.json()
+            products = data.get("data", {}).get("products", [])
+            print(f"Page {page_num} -> products returned: {len(products)}")
+
+            if not products:
+                print("No products on this page, stopping.")
+                break
+
+            new_products = [p for p in products if p.get("id") not in seen_ids]
+
+            if not new_products:
+                consecutive_duplicate_pages += 1
+                print(f"All products on this page already seen "
+                      f"({consecutive_duplicate_pages}/{MAX_CONSECUTIVE_DUPLICATE_PAGES} consecutive duplicate pages).")
+                if consecutive_duplicate_pages >= MAX_CONSECUTIVE_DUPLICATE_PAGES:
+                    print("Confirmed end of catalog. Stopping.")
                     break
-
-                data = response.json()
-                products = data.get("data", {}).get("products", [])
-                print(f"Page {page_num} -> products returned: {len(products)}")
-
-                if not products:
-                    print("No products on this page, stopping.")
-                    break
-
-                current_ids = tuple(p.get("id") for p in products)
-                if current_ids == previous_ids:
-                    print("Same products as previous page detected. Reached end of catalog. Stopping.")
-                    break
-                previous_ids = current_ids
-
-                for p in products:
-                    if total_items >= MAX_ITEMS:
-                        break
-                    try:
-                        row = build_row(p)
-                        writer.writerow(row)
-                        file.flush()
-                        total_items += 1
-                        elapsed = time.time() - start_time
-                        print(f"[{total_items}/{MAX_ITEMS}] {row[1]} (elapsed: {elapsed:.1f}s)")
-                    except Exception:
-                        print(f"[Row error] id={p.get('id')} name={p.get('name_en')}")
-                        traceback.print_exc()
-                        continue
-
                 page_num += 1
-
-            except requests.exceptions.RequestException as e:
-                print(f"[Connection issue] {e} - retrying in 5s")
-                time.sleep(5)
                 continue
+            else:
+                consecutive_duplicate_pages = 0
+
+            for p in products:
+                seen_ids.add(p.get("id"))
+
+            for p in new_products:
+                if total_items >= MAX_ITEMS:
+                    break
+                try:
+                    row = build_row(p)
+                    writer.writerow(row)
+                    csv_file.flush()
+                    progress_file.write(f"{p.get('id')}\n")
+                    progress_file.flush()
+                    total_items += 1
+                    elapsed = time.time() - start_time
+                    print(f"[{total_items}/{MAX_ITEMS}] {row[1]} (elapsed: {elapsed:.1f}s)")
+
+                    if total_items % CHECKPOINT_EVERY == 0:
+                        csv_file.flush()
+                        progress_file.flush()
+                        git_checkpoint(total_items)
+
+                except Exception:
+                    print(f"[Row error] id={p.get('id')} name={p.get('name_en')}")
+                    traceback.print_exc()
+                    continue
+
+            page_num += 1
+
+        except requests.exceptions.RequestException as e:
+            print(f"[Connection issue] {e} - retrying in 5s")
+            time.sleep(5)
+            continue
+
+    csv_file.close()
+    progress_file.close()
+
+    git_checkpoint(total_items)
 
     total_time = time.time() - start_time
-    print(f"\nDone. Saved {total_items} items to {filename} in {total_time:.1f} seconds "
-          f"({total_time/max(total_items,1):.1f}s per item on average).")
+    print(f"\nDone. Total items in file: {total_items}. This run took {total_time:.1f} seconds.")
 
 
 if __name__ == "__main__":
