@@ -7,6 +7,8 @@ jobs:
   scrape:
     runs-on: ubuntu-latest
     timeout-minutes: 300
+    permissions:
+      contents: write
 
     steps:
       - name: Checkout repo
@@ -21,7 +23,7 @@ jobs:
         run: pip install requests
 
       - name: Run scraper
-        run: python phdrfhar.py
+        run: python -u phdrfhar.py
 
       - name: Commit and push updated CSV
         run: |
