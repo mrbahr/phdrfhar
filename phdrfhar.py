@@ -203,7 +203,7 @@ def run_scraper():
     page_num = 1
     start_time = time.time()
     consecutive_duplicate_pages = 0
-    MAX_CONSECUTIVE_DUPLICATE_PAGES = 5
+    MAX_CONSECUTIVE_DUPLICATE_PAGES = 150
     MAX_PAGES_SAFETY = 3000
     catalog_finished = False
     known_total = None
