@@ -21,7 +21,7 @@ jobs:
         run: pip install requests
 
       - name: Run scraper
-        run: python scrape_pharmacy.py
+        run: python phdrfhar.py
 
       - name: Commit and push updated CSV
         run: |
